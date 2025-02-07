@@ -84,7 +84,7 @@ def preprocess_text(text: str, tokenizer, max_length=128):
         return_tensors="pt",
         max_length=max_length,
         truncation=True,
-        padding="max_length",
+        padding=False,
     )
     return inputs
 
@@ -154,6 +154,147 @@ def fit_umap_or_pca_per_head(
 ###############################################################################
 # 4. 可視化用関数（ヘッドごとの軸範囲を固定）
 ###############################################################################
+def plot_head_layer_individual_figs(
+    text: str,
+    tokenizer,
+    model: BertModelWithQKV,
+    reducers_per_head,
+    num_layers: int = 12,
+    num_heads: int = 12,
+    max_length=20,
+    output_dir: str = "qkv_outputs",
+):
+    """
+    各ヘッド × 各レイヤーごとに図を作り、下記パスに保存:
+        {output_dir}/head{head_idx}/layer{layer_idx}.png
+
+    なお、同じヘッド内で x,y 軸を揃えたい場合は、レイヤー分の投影結果を
+    先にまとめて算出して min/max を取得し、各レイヤー描画時に同じ軸範囲を指定する。
+    """
+
+    # まず対象テキストを forward し、全レイヤーの q, k, v をフックで取得
+    inputs = preprocess_text(text, tokenizer, max_length=max_length)
+    with torch.no_grad():
+        model(**inputs)
+
+    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+    seq_len = len(tokens)
+
+    # データを一括で保存するための辞書
+    data_dict = {}
+    # ヘッドごとの全レイヤーを通しての x, y を保持
+    x_vals_per_head = [[] for _ in range(num_heads)]
+    y_vals_per_head = [[] for _ in range(num_heads)]
+
+    # -------------------
+    # すべての (layer, head) で 2次元埋め込みと CLS-スコアを算出
+    # -------------------
+    for layer_idx in range(num_layers):
+        q, k, v = model.get_qkv_from_layer(layer_idx)
+        q_split = split_heads(q, num_heads=num_heads)[0]  # (num_heads, seq_len, head_dim)
+        k_split = split_heads(k, num_heads=num_heads)[0]
+        v_split = split_heads(v, num_heads=num_heads)[0]
+
+        for head_idx in range(num_heads):
+            head_q = q_split[head_idx]
+            head_k = k_split[head_idx]
+            head_v = v_split[head_idx].detach().cpu().numpy()  # shape: (seq_len, head_dim)
+
+            # Attention スコア (shape: (seq_len, seq_len))
+            attn_scores = (head_q @ head_k.transpose(-2, -1)) * (1.0 / np.sqrt(head_q.size(-1)))
+            attn_scores = torch.nn.functional.softmax(attn_scores, dim=-1).detach().cpu().numpy()
+
+            cls_attn = attn_scores[0, :]  # CLS行 (CLS→各トークンのスコア)
+
+            # UMAP/PCA で 2 次元へ射影
+            reduced = reducers_per_head[head_idx].transform(head_v)  # shape: (seq_len, 2)
+
+            data_dict[(layer_idx, head_idx)] = {
+                "reduced": reduced,
+                "cls_attn": cls_attn,
+            }
+
+            # 軸そろえ用に保存
+            x_vals_per_head[head_idx].append(reduced[:, 0])
+            y_vals_per_head[head_idx].append(reduced[:, 1])
+
+    # -------------------
+    # ヘッドごとに x,y の最小値・最大値を計算
+    # -------------------
+    x_min_per_head = {}
+    x_max_per_head = {}
+    y_min_per_head = {}
+    y_max_per_head = {}
+
+    for head_idx in range(num_heads):
+        all_x = np.concatenate(x_vals_per_head[head_idx])
+        all_y = np.concatenate(y_vals_per_head[head_idx])
+
+        x_min_per_head[head_idx] = all_x.min()
+        x_max_per_head[head_idx] = all_x.max()
+        y_min_per_head[head_idx] = all_y.min()
+        y_max_per_head[head_idx] = all_y.max()
+
+    # -------------------
+    # ヘッド × レイヤーごとに 1枚ずつ図を作成・保存
+    # -------------------
+    for head_idx in range(num_heads):
+        # headごとの出力フォルダ
+        head_dir = os.path.join(output_dir, f"head{head_idx}")
+        os.makedirs(head_dir, exist_ok=True)
+
+        # 軸範囲を取得
+        x_min, x_max = x_min_per_head[head_idx], x_max_per_head[head_idx]
+        y_min, y_max = y_min_per_head[head_idx], y_max_per_head[head_idx]
+
+        for layer_idx in range(num_layers):
+            reduced = data_dict[(layer_idx, head_idx)]["reduced"]
+            cls_attn = data_dict[(layer_idx, head_idx)]["cls_attn"]
+
+            fig, ax = plt.subplots(figsize=(5, 4))
+
+            # CLS とそれ以外でマーカーサイズを変化
+            sizes = cls_attn[1:] * 1500
+            cls_size = cls_attn[0] * 1500
+
+            # 通常トークンを散布図
+            ax.scatter(
+                reduced[1:, 0], reduced[1:, 1],
+                s=sizes, alpha=0.4, c="blue", label="tokens"
+            )
+            # CLSトークンを赤いマーカーで
+            ax.scatter(
+                reduced[0, 0], reduced[0, 1],
+                s=cls_size, c="red", alpha=0.8, label="CLS"
+            )
+
+            ax.set_title(f"Layer {layer_idx}, Head {head_idx}")
+            ax.set_xlim([x_min, x_max])
+            ax.set_ylim([y_min, y_max])
+            ax.set_xlabel("Component 1")
+            ax.set_ylabel("Component 2")
+
+            # トークン名を配置
+            if seq_len <= 32:
+                for i in range(seq_len):
+                    ax.text(
+                        reduced[i, 0],
+                        reduced[i, 1],
+                        tokens[i],
+                        fontsize=6,
+                        ha="center",
+                        va="center",
+                        color="black",
+                    )
+
+            # 画像を保存
+            save_path = os.path.join(head_dir, f"layer{layer_idx}.png")
+            plt.savefig(save_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+
+    print(f"Plots saved under '{output_dir}/head*/layer*.png'.")
+
+
 def plot_all_layers_with_shared_head_reducers(
     text: str,
     tokenizer,
@@ -249,7 +390,7 @@ def plot_all_layers_with_shared_head_reducers(
 
             # Attention スコアに基づくサイズ設定
             sizes = cls_attn[1:] * 1500  # CLS トークン以外のトークン
-            cls_tkn_size = cls_attn[0] * 2000  # CLS トークン自身
+            cls_tkn_size = cls_attn[0] * 1500  # CLS トークン自身
 
             ax = axes[layer_idx, head_idx]
             ax.scatter(reduced[1:, 0], reduced[1:, 1], s=sizes, alpha=0.5, c="blue")
@@ -268,16 +409,17 @@ def plot_all_layers_with_shared_head_reducers(
             ax.set_ylabel("Component 2")
 
             # トークンを点の近くに表示
-            for i in range(seq_len):
-                ax.text(
-                    reduced[i, 0],
-                    reduced[i, 1],
-                    tokens[i],
-                    fontsize=6,
-                    ha="center",
-                    va="center",
-                    color="black",
-                )
+            if seq_len <= 32:
+                for i in range(seq_len):
+                    ax.text(
+                        reduced[i, 0],
+                        reduced[i, 1],
+                        tokens[i],
+                        fontsize=6,
+                        ha="center",
+                        va="center",
+                        color="black",
+                    )
 
     plt.tight_layout()
 
@@ -309,6 +451,9 @@ def main():
     texts_for_fitting = [
         "She was a teacher for forty years and her writing has appeared in journals and anthologies since the early 1980s."
     ]
+    # texts_for_fitting = [
+    #     "it’s a good thing most animated sci-fi movies come from japan, because “titan a.e.” is proof that hollywood doesn’t have a clue how to do it. i don’t know what this film is supposed to be about. from what i can tell it’s about a young man named kale who’s one of the last survivors of earth in the early 31st century who unknowingly possesses the key to saving and re-generating what is left of the human race. that’s a fine premise for an action-packed sci-fi animated movie, but there’s no payoff. the story takes the main characters all over the galaxy in their search for a legendary ship that the evil “dredge” aliens want to destroy for no apparent reason. so in the process we get a lot of spaceship fights, fistfights, blaster fights and more double-crosses than you can shake a stick at. there’s so much pointless sci-fi banter it’s too much to take. the galaxy here is a total rip-off of the “star wars” universe the creators don’t bother filling in the basic details which makes the story confusing, the characters unmotivated and superficial and the plot just plain boring. despite the fantastic animation and special effects, it’s just not an interesting movie."
+    # ]
 
     num_layers = 12
     num_heads = 12
@@ -330,6 +475,19 @@ def main():
     # 可視化と保存
     # =======================
     text_to_plot = "She was a teacher for forty years and her writing has appeared in journals and anthologies since the early 1980s."
+    # text_to_plot = "it’s a good thing most animated sci-fi movies come from japan, because “titan a.e.” is proof that hollywood doesn’t have a clue how to do it. i don’t know what this film is supposed to be about. from what i can tell it’s about a young man named kale who’s one of the last survivors of earth in the early 31st century who unknowingly possesses the key to saving and re-generating what is left of the human race. that’s a fine premise for an action-packed sci-fi animated movie, but there’s no payoff. the story takes the main characters all over the galaxy in their search for a legendary ship that the evil “dredge” aliens want to destroy for no apparent reason. so in the process we get a lot of spaceship fights, fistfights, blaster fights and more double-crosses than you can shake a stick at. there’s so much pointless sci-fi banter it’s too much to take. the galaxy here is a total rip-off of the “star wars” universe the creators don’t bother filling in the basic details which makes the story confusing, the characters unmotivated and superficial and the plot just plain boring. despite the fantastic animation and special effects, it’s just not an interesting movie."
+
+    plot_head_layer_individual_figs(
+        text=text_to_plot,
+        tokenizer=tokenizer,
+        model=model,
+        reducers_per_head=reducers_per_head,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        max_length=512,
+        output_dir="qkv_outputs",
+    )
+
     plot_all_layers_with_shared_head_reducers(
         text=text_to_plot,
         tokenizer=tokenizer,
@@ -337,12 +495,11 @@ def main():
         reducers_per_head=reducers_per_head,
         num_layers=num_layers,
         num_heads=num_heads,
-        max_length=16,
+        max_length=512,
         output_dir="qkv_outputs",
         output_filename="all_layers_heads_values.png",
         show_plot=False,
     )
-
 
 if __name__ == "__main__":
     main()
